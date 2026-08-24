@@ -60,7 +60,8 @@ struct AuPackageConfig {
     /// Optional human-readable description shown by some hosts.
     #[serde(default)]
     description: Option<String>,
-    /// Plugin version as `"major.minor.patch"`. Defaults to `"1.0.0"`.
+    /// Optional AU-only version override as `"major.minor.patch"`. By default
+    /// the Cargo package version is used, like the other macOS bundle formats.
     #[serde(default)]
     version: Option<String>,
 }
@@ -246,6 +247,7 @@ pub fn build(packages: &[String], args: &[String]) -> Result<()> {
 /// specified instead, then this will assume both `x86_64-apple-darwin` and `aarch64-apple-darwin`
 /// have been built and it will try to lipo those together instead.
 pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool) -> Result<()> {
+    let package_version = package_version(Path::new("./Cargo.toml"), package)?;
     let mut build_type_dir = "debug";
     let mut cross_compile_target: Option<String> = None;
     for arg_idx in (0..args.len()).rev() {
@@ -316,6 +318,7 @@ pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool
             bundle_binary(
                 target_dir,
                 package,
+                &package_version,
                 &[&x86_64_bin_path, &aarch64_bin_path],
                 CompilationTarget::MacOSUniversal,
             )?;
@@ -324,6 +327,7 @@ pub fn bundle(target_dir: &Path, package: &str, args: &[String], universal: bool
             bundle_plugin(
                 target_dir,
                 package,
+                &package_version,
                 &[&x86_64_lib_path, &aarch64_lib_path],
                 CompilationTarget::MacOSUniversal,
             )?;
@@ -350,14 +354,58 @@ to your Cargo.toml file?"#,
 
         eprintln!();
         if bin_path.exists() {
-            bundle_binary(target_dir, package, &[&bin_path], compilation_target)?;
+            bundle_binary(
+                target_dir,
+                package,
+                &package_version,
+                &[&bin_path],
+                compilation_target,
+            )?;
         }
         if lib_path.exists() {
-            bundle_plugin(target_dir, package, &[&lib_path], compilation_target)?;
+            bundle_plugin(
+                target_dir,
+                package,
+                &package_version,
+                &[&lib_path],
+                compilation_target,
+            )?;
         }
     }
 
     Ok(())
+}
+
+/// Resolve the package version through Cargo instead of duplicating it in
+/// `bundler.toml`. This supports workspace-inherited versions and every valid
+/// Cargo.toml layout without maintaining a second TOML parser here.
+///
+/// Apple requires both bundle version keys to contain only numeric
+/// major/minor/patch components. Cargo prerelease and build metadata therefore
+/// identify the build outside Info.plist, while the Apple bundle version uses
+/// the corresponding release tuple.
+fn package_version(manifest_path: &Path, package: &str) -> Result<String> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .no_deps()
+        .exec()
+        .context("Could not parse `cargo-metadata` while resolving the bundle version")?;
+
+    metadata
+        .packages
+        .iter()
+        .find(|candidate| candidate.name == package)
+        .map(|candidate| apple_bundle_version(&candidate.version))
+        .with_context(|| {
+            format!(
+                "Could not find package '{package}' in Cargo metadata from '{}'",
+                manifest_path.display()
+            )
+        })
+}
+
+fn apple_bundle_version(version: &cargo_metadata::semver::Version) -> String {
+    format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
 /// Bundle a standalone target. If `bin_path` contains more than one path, then the binaries will be
@@ -366,12 +414,15 @@ to your Cargo.toml file?"#,
 fn bundle_binary(
     target_dir: &Path,
     package: &str,
+    package_version: &str,
     bin_paths: &[&Path],
     compilation_target: CompilationTarget,
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
     let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name), .. }) => name,
+        Some(PackageConfig {
+            name: Some(name), ..
+        }) => name,
         _ => package.to_string(),
     };
 
@@ -407,9 +458,10 @@ fn bundle_binary(
             .next()
             .expect("Malformed standalone binary path"),
     );
-    maybe_create_macos_bundle_metadata(
+    create_macos_bundle_metadata(
         package,
         &bundle_name,
+        package_version,
         &standalone_bundle_home,
         compilation_target,
         BundleType::Binary,
@@ -430,12 +482,15 @@ fn bundle_binary(
 fn bundle_plugin(
     target_dir: &Path,
     package: &str,
+    package_version: &str,
     lib_paths: &[&Path],
     compilation_target: CompilationTarget,
 ) -> Result<()> {
     let bundle_home_dir = bundle_home(target_dir);
     let bundle_name = match load_bundler_config()?.and_then(|c| c.get(package).cloned()) {
-        Some(PackageConfig { name: Some(name), .. }) => name,
+        Some(PackageConfig {
+            name: Some(name), ..
+        }) => name,
         _ => package.to_string(),
     };
 
@@ -480,9 +535,10 @@ fn bundle_plugin(
                 .next()
                 .expect("Malformed CLAP library path"),
         );
-        maybe_create_macos_bundle_metadata(
+        create_macos_bundle_metadata(
             package,
             &bundle_name,
+            package_version,
             &clap_bundle_home,
             compilation_target,
             BundleType::Plugin,
@@ -508,9 +564,10 @@ fn bundle_plugin(
                 .next()
                 .expect("Malformed VST2 library path"),
         );
-        maybe_create_macos_bundle_metadata(
+        create_macos_bundle_metadata(
             package,
             &bundle_name,
+            package_version,
             &vst2_bundle_home,
             compilation_target,
             BundleType::Plugin,
@@ -535,9 +592,10 @@ fn bundle_plugin(
             .unwrap()
             .parent()
             .unwrap();
-        maybe_create_macos_bundle_metadata(
+        create_macos_bundle_metadata(
             package,
             &bundle_name,
+            package_version,
             vst3_bundle_home,
             compilation_target,
             BundleType::Plugin,
@@ -550,10 +608,12 @@ fn bundle_plugin(
         let au_config = load_bundler_config()?
             .and_then(|c| c.get(package).cloned())
             .and_then(|c| c.au)
-            .with_context(|| format!(
-                "Package '{package}' exports an Audio Unit factory but bundler.toml has no \
+            .with_context(|| {
+                format!(
+                    "Package '{package}' exports an Audio Unit factory but bundler.toml has no \
                  [{package}.au] section. Add type/subtype/manufacturer four-character codes."
-            ))?;
+                )
+            })?;
 
         let au_lib_path =
             bundle_home_dir.join(au_bundle_library_name(&bundle_name, compilation_target));
@@ -564,8 +624,20 @@ fn bundle_plugin(
             .context("Could not create AU bundle")?;
 
         // `{name}.component/Contents/MacOS/{name}` → bundle home is the `.component` dir.
-        let au_bundle_home = au_lib_path.parent().unwrap().parent().unwrap().parent().unwrap();
-        create_au_bundle_metadata(package, &bundle_name, au_bundle_home, &au_config)?;
+        let au_bundle_home = au_lib_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        create_au_bundle_metadata(
+            package,
+            &bundle_name,
+            package_version,
+            au_bundle_home,
+            &au_config,
+        )?;
         maybe_codesign(au_bundle_home, compilation_target);
 
         eprintln!("Created an AU bundle at '{}'", au_bundle_home.display());
@@ -811,6 +883,24 @@ pub fn maybe_create_macos_bundle_metadata(
     target: CompilationTarget,
     bundle_type: BundleType,
 ) -> Result<()> {
+    create_macos_bundle_metadata(
+        package,
+        display_name,
+        "1.0.0",
+        bundle_home,
+        target,
+        bundle_type,
+    )
+}
+
+fn create_macos_bundle_metadata(
+    package: &str,
+    display_name: &str,
+    package_version: &str,
+    bundle_home: &Path,
+    target: CompilationTarget,
+    bundle_type: BundleType,
+) -> Result<()> {
     if !matches!(
         target,
         CompilationTarget::MacOS(_) | CompilationTarget::MacOSUniversal
@@ -823,8 +913,7 @@ pub fn maybe_create_macos_bundle_metadata(
         BundleType::Binary => "APPL",
     };
 
-    // TODO: May want to add bundler.toml fields for the identifier, version and signature at some
-    //       point.
+    // TODO: May want to add bundler.toml fields for the identifier and signature at some point.
     fs::write(
         bundle_home.join("Contents").join("PkgInfo"),
         format!("{package_type}????"),
@@ -852,9 +941,9 @@ pub fn maybe_create_macos_bundle_metadata(
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>{package_version}</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>{package_version}</string>
     <key>NSHumanReadableCopyright</key>
     <string></string>
     <key>NSHighResolutionCapable</key>
@@ -874,6 +963,7 @@ pub fn maybe_create_macos_bundle_metadata(
 fn create_au_bundle_metadata(
     package: &str,
     display_name: &str,
+    package_version: &str,
     bundle_home: &Path,
     config: &AuPackageConfig,
 ) -> Result<()> {
@@ -881,7 +971,7 @@ fn create_au_bundle_metadata(
     validate_fourcc(&config.subtype, "subtype")?;
     validate_fourcc(&config.manufacturer, "manufacturer")?;
 
-    let version_string = config.version.as_deref().unwrap_or("1.0.0");
+    let version_string = config.version.as_deref().unwrap_or(package_version);
     let version_int = parse_au_version(version_string)?;
     let description = config
         .description
@@ -894,11 +984,8 @@ fn create_au_bundle_metadata(
     let component_name = format!("{mfr_display}: {display_name}");
 
     fs::create_dir_all(bundle_home.join("Contents")).context("Could not create Contents/")?;
-    fs::write(
-        bundle_home.join("Contents").join("PkgInfo"),
-        "BNDL????",
-    )
-    .context("Could not create PkgInfo file")?;
+    fs::write(bundle_home.join("Contents").join("PkgInfo"), "BNDL????")
+        .context("Could not create PkgInfo file")?;
     fs::write(
         bundle_home.join("Contents").join("Info.plist"),
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1031,6 +1118,23 @@ pub fn maybe_codesign(bundle_home: &Path, target: CompilationTarget) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_version_comes_from_cargo_metadata() {
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert_eq!(
+            package_version(&manifest_path, "nih_plug_xtask").unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn apple_bundle_version_strips_non_numeric_semver_metadata() {
+        let version = cargo_metadata::semver::Version::parse("1.2.3-beta.4+build.5").unwrap();
+        let bundle_version = apple_bundle_version(&version);
+        assert_eq!(bundle_version, "1.2.3");
+        assert_eq!(parse_au_version(&bundle_version).unwrap(), 0x0001_0203);
+    }
 
     #[test]
     fn fourcc_accepts_four_ascii() {
