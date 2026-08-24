@@ -11,7 +11,7 @@
 # subtype = "Abcd"        # 4cc unique within manufacturer's product line
 # manufacturer = "MyCo"   # 4cc manufacturer code
 # description = "..."     # optional, shown by some hosts
-# version = "1.0.0"       # optional, defaults to "1.0.0"
+# version = "1.0.0"       # optional AU-only override; defaults to the Cargo package version
 
 [gain]
 name = "Gain"

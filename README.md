@@ -188,7 +188,10 @@ NIH-plug can currently export VST3, [CLAP](https://github.com/free-audio/clap),
 and macOS Audio Unit v2 plugins. Exporting a specific plugin format is as simple
 as calling the `nih_export_<format>!(Foo);` macro. The `cargo xtask bundle`
 command detects which formats a plugin supports and creates the appropriate
-bundles, including `.component` bundles on macOS.
+bundles, including `.component` bundles on macOS. The macOS VST3, CLAP, AU, and
+standalone bundle version fields default to the Cargo package version's numeric
+major/minor/patch tuple. Cargo prerelease and build suffixes are omitted because
+Apple requires these Info.plist keys to contain three period-separated integers.
 
 An Audio Unit implements `AuPlugin` with its type, subtype, and manufacturer
 four-character codes, calls `nih_export_au!(Foo)`, and adds the matching
